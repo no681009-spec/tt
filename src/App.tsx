@@ -622,17 +622,41 @@ export default function App() {
         },
       }));
 
-      // 傳送原始清晰相片給後端 Gemini API 進行電錶度數判讀
+      // 傳送原始清晰相片給後端進行電錶度數判讀（支援本機/Cloud Run 與 GitHub Pages 跨網域自動切換）
       const rawBase64 = rawDataUrl.split(",")[1];
-      const response = await fetch("/api/recognize-meter", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageBase64: rawBase64,
-          mimeType: "image/jpeg",
-          room,
-        }),
+      const requestBody = JSON.stringify({
+        imageBase64: rawBase64,
+        mimeType: "image/jpeg",
+        room,
       });
+
+      const isGitHubPages =
+        typeof window !== "undefined" &&
+        window.location.hostname.endsWith("github.io");
+      const cloudRunApiUrl =
+        "https://ais-pre-6fr6e6nrj5qe2bjyx6a5oi-654172174697.asia-east1.run.app/api/recognize-meter";
+
+      let response: Response;
+      if (isGitHubPages) {
+        response = await fetch(cloudRunApiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        });
+      } else {
+        response = await fetch("/api/recognize-meter", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        });
+        if (response.status === 404 || response.status === 405) {
+          response = await fetch(cloudRunApiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: requestBody,
+          });
+        }
+      }
 
       const data = await response.json();
 

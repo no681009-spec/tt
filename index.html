@@ -16,6 +16,25 @@
   <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-600 selection:text-white">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // 若發佈於 GitHub Pages 且未透過 GitHub Actions 編譯（直接讀取 main 分支根目錄），自動載入預編譯靜態檔，避免空白畫面
+      window.addEventListener('DOMContentLoaded', function () {
+        setTimeout(function () {
+          var root = document.getElementById('root');
+          if (root && root.children.length === 0) {
+            var css = document.createElement('link');
+            css.rel = 'stylesheet';
+            css.href = './public/gh-pages/app.css';
+            document.head.appendChild(css);
+
+            var script = document.createElement('script');
+            script.type = 'module';
+            script.src = './public/gh-pages/app.js';
+            document.body.appendChild(script);
+          }
+        }, 350);
+      });
+    </script>
   </body>
 </html>
 
