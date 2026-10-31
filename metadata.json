@@ -1,0 +1,6 @@
+{
+  "name": "套房電錶拍照算費系統",
+  "description": "專為房東設計的出租套房電錶影像辨識與租金水電核算系統，支援自動判讀電錶度數、壓印抄表日期浮水印與匯出帳單明細。",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
