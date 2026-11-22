@@ -20,6 +20,10 @@ import {
   Minus,
   Sparkles,
   FileText,
+  Lock,
+  ShieldCheck,
+  KeyRound,
+  LogOut,
 } from "lucide-react";
 
 const ROOM_KEYS = ["102", "201", "202", "301", "302"] as const;
@@ -27,13 +31,18 @@ type RoomKey = (typeof ROOM_KEYS)[number];
 type TabKey = RoomKey | "summary";
 
 const DB_KEY_PREFIX = "suite_meter_v2026_";
+const RENTS_STORAGE_KEY = `${DB_KEY_PREFIX}room_rents`;
+const CLOUD_RUN_API_BASE = (
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://ais-pre-6fr6e6nrj5qe2bjyx6a5oi-654172174697.asia-east1.run.app"
+).replace(/\/+$/, "");
 
-const DEFAULT_ROOM_RENTS: Record<RoomKey, number> = {
-  "102": 6500,
-  "201": 8000,
-  "202": 6000,
-  "301": 8500,
-  "302": 6500,
+const EMPTY_ROOM_RENTS: Record<RoomKey, number> = {
+  "102": 0,
+  "201": 0,
+  "202": 0,
+  "301": 0,
+  "302": 0,
 };
 
 interface HistoryRecord {
@@ -42,6 +51,7 @@ interface HistoryRecord {
   rentEnd: string;
   meterDate: string;
   occupants: number;
+  rentPay?: number;
   waterPay: number;
   prevDegree: number;
   currDegree: number;
@@ -358,6 +368,45 @@ export default function App() {
     getLocalTodayStr()
   );
 
+  // Per-room monthly rent stored strictly in local browser storage (never hardcoded in public code)
+  const [roomRents, setRoomRents] = useState<Record<RoomKey, number>>(() => {
+    const base: Record<RoomKey, number> = { ...EMPTY_ROOM_RENTS };
+    try {
+      const raw = localStorage.getItem(RENTS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<Record<RoomKey, unknown>>;
+        ROOM_KEYS.forEach((room) => {
+          const val = Number(parsed?.[room]);
+          if (Number.isFinite(val) && val >= 0) {
+            base[room] = Math.floor(val);
+          }
+        });
+      }
+    } catch {
+      // Keep zero defaults
+    }
+    return base;
+  });
+
+  // Landlord passcode auth state — Bearer token kept strictly in JS/React memory (never in localStorage/sessionStorage)
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const authTokenRef = useRef<string | null>(null);
+  const [authStatus, setAuthStatus] = useState<{
+    checked: boolean;
+    configured: boolean;
+    source: "env" | "claimed" | "unclaimed";
+  }>({ checked: false, configured: true, source: "env" });
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [passcodeInput, setPasscodeInput] = useState("");
+  const [passcodeConfirmInput, setPasscodeConfirmInput] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const pendingAiRequestRef = useRef<{
+    rawDataUrl: string;
+    room: RoomKey;
+    targetField: "curr" | "prev";
+  } | null>(null);
+
   const [rooms, setRooms] = useState<Record<RoomKey, RoomState>>(() => {
     const todayStr = getLocalTodayStr();
     const initial = {} as Record<RoomKey, RoomState>;
@@ -402,6 +451,7 @@ export default function App() {
           target: null,
         },
         cachedBillMessage: null,
+        lastSavedSnapshot: null,
       };
     });
 
@@ -453,6 +503,85 @@ export default function App() {
     const timer = setTimeout(() => setToast(null), 2800);
     return () => clearTimeout(timer);
   }, [toast]);
+
+  const apiFetch = useCallback(
+    async (
+      endpointPath: string,
+      init: RequestInit = {},
+      overrideToken?: string | null
+    ): Promise<Response> => {
+      const token =
+        overrideToken !== undefined ? overrideToken : authTokenRef.current;
+      const headers = new Headers(init.headers || {});
+      if (token) {
+        headers.set("Authorization", `Bearer ${token}`);
+      }
+      const reqInit: RequestInit = { ...init, headers };
+
+      const isGitHubPages =
+        typeof window !== "undefined" &&
+        window.location.hostname.endsWith("github.io");
+
+      if (isGitHubPages) {
+        return fetch(`${CLOUD_RUN_API_BASE}${endpointPath}`, reqInit);
+      }
+
+      const res = await fetch(endpointPath, reqInit);
+      if (res.status === 404 || res.status === 405) {
+        return fetch(`${CLOUD_RUN_API_BASE}${endpointPath}`, reqInit);
+      }
+      return res;
+    },
+    []
+  );
+
+  const fetchAuthStatus = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/auth/status", { method: "GET" });
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        configured?: boolean;
+        source?: "env" | "claimed" | "unclaimed";
+        authenticated?: boolean;
+      };
+      setAuthStatus({
+        checked: true,
+        configured: Boolean(data.configured),
+        source: data.source || "env",
+      });
+      if (data.authenticated === false && authTokenRef.current) {
+        authTokenRef.current = null;
+        setAuthToken(null);
+      }
+    } catch {
+      // Offline or unreachable backend; manual mode still works locally
+    }
+  }, [apiFetch]);
+
+  useEffect(() => {
+    fetchAuthStatus();
+  }, [fetchAuthStatus]);
+
+  const handleRentChange = (room: RoomKey, rawVal: string) => {
+    const cleaned = rawVal.replace(/[^\d]/g, "");
+    const parsed = cleaned === "" ? 0 : Math.min(999999, parseInt(cleaned, 10));
+    setRoomRents((prev) => {
+      const next = { ...prev, [room]: parsed };
+      try {
+        localStorage.setItem(RENTS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // ignore quota issues
+      }
+      return next;
+    });
+    setRooms((prev) => ({
+      ...prev,
+      [room]: {
+        ...prev[room],
+        cachedBillMessage: null,
+      },
+    }));
+  };
 
   // Calculate Room 202 rate based on globalEndDate month (June-Sept: 5.5, else 5.0)
   const get202Rate = useCallback(
@@ -544,7 +673,7 @@ export default function App() {
     const elecPay = Math.floor(used * rate);
     const occupants = Math.max(1, rState.occupants || 1);
     const waterPay = occupants * 100;
-    const rent = DEFAULT_ROOM_RENTS[room];
+    const rent = roomRents[room] || 0;
     const totalPay = rent + waterPay + elecPay;
 
     return {
@@ -599,13 +728,34 @@ export default function App() {
 *(請核對明細無誤後繳納，謝謝您！)*`;
   };
 
-  const processSelectedFile = async (
-    file: File,
+  const runAiRecognition = async (
+    rawDataUrl: string,
     room: RoomKey,
-    targetField: "curr" | "prev"
+    targetField: "curr" | "prev",
+    overrideToken?: string | null
   ) => {
     const isPrev = targetField === "prev";
-    showToast("正在壓印日期浮水印並進行智慧判讀電錶度數...", "info");
+    const activeToken =
+      overrideToken !== undefined ? overrideToken : authTokenRef.current;
+
+    if (!activeToken) {
+      pendingAiRequestRef.current = { rawDataUrl, room, targetField };
+      setRooms((prev) => ({
+        ...prev,
+        [room]: {
+          ...prev[room],
+          aiStatus: {
+            loading: false,
+            target: targetField,
+            error: "請先輸入房東存取密碼解鎖 AI 辨識",
+          },
+        },
+      }));
+      setAuthError(null);
+      await fetchAuthStatus();
+      setAuthModalOpen(true);
+      return;
+    }
 
     setRooms((prev) => ({
       ...prev,
@@ -619,67 +769,56 @@ export default function App() {
     }));
 
     try {
-      const { rawDataUrl, watermarkedBase64 } = await compressAndWatermarkImage(
-        file,
-        globalEndDate,
-        1200,
-        0.82
+      const rawBase64 = rawDataUrl.split(",")[1];
+      const response = await apiFetch(
+        "/api/recognize-meter",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            imageBase64: rawBase64,
+            mimeType: "image/jpeg",
+            room,
+          }),
+        },
+        activeToken
       );
 
-      // 先儲存浮水印相片至畫面預覽
-      setRooms((prev) => ({
-        ...prev,
-        [room]: {
-          ...prev[room],
-          rawCurrPhoto: isPrev ? prev[room].rawCurrPhoto : rawDataUrl,
-          watermarkedCurrPhoto: isPrev
-            ? prev[room].watermarkedCurrPhoto
-            : watermarkedBase64,
-          rawPrevPhoto: isPrev ? rawDataUrl : prev[room].rawPrevPhoto,
-          watermarkedPrevPhoto: isPrev
-            ? watermarkedBase64
-            : prev[room].watermarkedPrevPhoto,
-          cachedBillMessage: null,
-        },
-      }));
-
-      // 傳送原始清晰相片給後端進行電錶度數判讀（支援本機/Cloud Run 與 GitHub Pages 跨網域自動切換）
-      const rawBase64 = rawDataUrl.split(",")[1];
-      const requestBody = JSON.stringify({
-        imageBase64: rawBase64,
-        mimeType: "image/jpeg",
-        room,
-      });
-
-      const isGitHubPages =
-        typeof window !== "undefined" &&
-        window.location.hostname.endsWith("github.io");
-      const cloudRunApiUrl =
-        "https://ais-pre-6fr6e6nrj5qe2bjyx6a5oi-654172174697.asia-east1.run.app/api/recognize-meter";
-
-      let response: Response;
-      if (isGitHubPages) {
-        response = await fetch(cloudRunApiUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: requestBody,
-        });
-      } else {
-        response = await fetch("/api/recognize-meter", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: requestBody,
-        });
-        if (response.status === 404 || response.status === 405) {
-          response = await fetch(cloudRunApiUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: requestBody,
-          });
-        }
+      let data: {
+        isReadable?: boolean;
+        reading?: number;
+        meterType?: string;
+        rawDisplay?: string;
+        notes?: string;
+        error?: string;
+        code?: string;
+      } = {};
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
       }
 
-      const data = await response.json();
+      if (response.status === 401) {
+        authTokenRef.current = null;
+        setAuthToken(null);
+        pendingAiRequestRef.current = { rawDataUrl, room, targetField };
+        setRooms((prev) => ({
+          ...prev,
+          [room]: {
+            ...prev[room],
+            aiStatus: {
+              loading: false,
+              target: targetField,
+              error: data.error || "登入階段已過期，請重新輸入房東存取密碼",
+            },
+          },
+        }));
+        setAuthError(data.error || "請先輸入房東存取密碼解鎖 AI 辨識");
+        await fetchAuthStatus();
+        setAuthModalOpen(true);
+        return;
+      }
 
       if (!response.ok) {
         throw new Error(data.error || `API 失敗 (${response.status})`);
@@ -740,6 +879,168 @@ export default function App() {
         },
       }));
       showToast(`AI 辨識失敗：${msg}，請手動輸入度數`, "warn");
+    }
+  };
+
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = passcodeInput.trim();
+    if (trimmed.length < 4) {
+      setAuthError("請輸入至少 4 個字元的房東存取密碼");
+      return;
+    }
+
+    const isSetupMode = !authStatus.configured;
+    if (isSetupMode && trimmed !== passcodeConfirmInput.trim()) {
+      setAuthError("兩次輸入的密碼不一致，請重新確認");
+      return;
+    }
+
+    setAuthSubmitting(true);
+    setAuthError(null);
+
+    try {
+      const endpoint = isSetupMode ? "/api/auth/setup" : "/api/auth/login";
+      const response = await apiFetch(
+        endpoint,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ passcode: trimmed }),
+        },
+        null
+      );
+
+      let data: { token?: string; error?: string; code?: string } = {};
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
+
+      if (response.status === 412 && data.code === "SETUP_REQUIRED") {
+        setAuthStatus({
+          checked: true,
+          configured: false,
+          source: "unclaimed",
+        });
+        setAuthError(data.error || "尚未設定密碼，請先設定首次存取密碼");
+        return;
+      }
+
+      if (!response.ok || !data.token) {
+        setAuthError(data.error || `驗證失敗 (${response.status})`);
+        return;
+      }
+
+      authTokenRef.current = data.token;
+      setAuthToken(data.token);
+      setAuthStatus({
+        checked: true,
+        configured: true,
+        source: isSetupMode ? "claimed" : authStatus.source,
+      });
+      setPasscodeInput("");
+      setPasscodeConfirmInput("");
+      setAuthModalOpen(false);
+      showToast(
+        isSetupMode
+          ? "房東存取密碼已設定並解鎖 AI 辨識"
+          : "已解鎖房東 AI 電錶辨識功能",
+        "success"
+      );
+
+      const pending = pendingAiRequestRef.current;
+      if (pending) {
+        pendingAiRequestRef.current = null;
+        await runAiRecognition(
+          pending.rawDataUrl,
+          pending.room,
+          pending.targetField,
+          data.token
+        );
+      }
+    } catch {
+      setAuthError("無法連線至後端驗證服務，請確認網路或 ALLOWED_ORIGINS 設定");
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLockSession = async () => {
+    const token = authTokenRef.current;
+    authTokenRef.current = null;
+    setAuthToken(null);
+    pendingAiRequestRef.current = null;
+    if (token) {
+      try {
+        await apiFetch("/api/auth/logout", { method: "POST" }, token);
+      } catch {
+        // Ignore network errors on logout
+      }
+    }
+    showToast("已鎖定 AI 辨識功能", "info");
+  };
+
+  const processSelectedFile = async (
+    file: File,
+    room: RoomKey,
+    targetField: "curr" | "prev"
+  ) => {
+    const isPrev = targetField === "prev";
+    showToast("正在壓印日期浮水印並準備辨識電錶度數...", "info");
+
+    setRooms((prev) => ({
+      ...prev,
+      [room]: {
+        ...prev[room],
+        aiStatus: {
+          loading: true,
+          target: targetField,
+        },
+      },
+    }));
+
+    try {
+      const { rawDataUrl, watermarkedBase64 } = await compressAndWatermarkImage(
+        file,
+        globalEndDate,
+        1200,
+        0.82
+      );
+
+      // 先儲存浮水印相片至畫面預覽
+      setRooms((prev) => ({
+        ...prev,
+        [room]: {
+          ...prev[room],
+          rawCurrPhoto: isPrev ? prev[room].rawCurrPhoto : rawDataUrl,
+          watermarkedCurrPhoto: isPrev
+            ? prev[room].watermarkedCurrPhoto
+            : watermarkedBase64,
+          rawPrevPhoto: isPrev ? rawDataUrl : prev[room].rawPrevPhoto,
+          watermarkedPrevPhoto: isPrev
+            ? watermarkedBase64
+            : prev[room].watermarkedPrevPhoto,
+          cachedBillMessage: null,
+        },
+      }));
+
+      await runAiRecognition(rawDataUrl, room, targetField);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "相片處理發生異常";
+      setRooms((prev) => ({
+        ...prev,
+        [room]: {
+          ...prev[room],
+          aiStatus: {
+            loading: false,
+            target: targetField,
+            error: msg,
+          },
+        },
+      }));
+      showToast(`相片處理失敗：${msg}，請手動輸入度數`, "warn");
     }
   };
 
@@ -1048,6 +1349,7 @@ export default function App() {
       rentEnd: rState.rentEnd,
       meterDate: globalEndDate,
       occupants: metrics.occupants,
+      rentPay: metrics.rent,
       waterPay: metrics.waterPay,
       prevDegree: metrics.prev,
       currDegree: metrics.curr,
@@ -1284,7 +1586,9 @@ export default function App() {
       const rowY = thY + tableHeadHeight + idx * rowHeight;
       const rState = rooms[room];
       const latest = rState.history[0];
-      const rentBase = DEFAULT_ROOM_RENTS[room];
+      const rentBase =
+        roomRents[room] ||
+        (latest?.rentPay !== undefined ? Number(latest.rentPay) : 0);
       const occ = latest ? latest.occupants || 1 : rState.occupants || 1;
       const waterFee = latest
         ? latest.waterPay !== undefined
@@ -1392,7 +1696,9 @@ export default function App() {
     ROOM_KEYS.forEach((room) => {
       const rState = rooms[room];
       const latest = rState.history[0];
-      const rentBase = DEFAULT_ROOM_RENTS[room];
+      const rentBase =
+        roomRents[room] ||
+        (latest?.rentPay !== undefined ? Number(latest.rentPay) : 0);
       const currentOcc = rState.occupants || 1;
 
       if (latest) {
@@ -1531,8 +1837,36 @@ export default function App() {
             </button>
           </nav>
 
-          <div className="hidden md:flex items-center text-xs text-slate-400 font-mono whitespace-nowrap shrink-0">
-            <span>202費率: {rate202.toFixed(1)}元/度</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="hidden md:inline text-xs text-slate-400 font-mono whitespace-nowrap">
+              202費率: {rate202.toFixed(1)}元/度
+            </span>
+            {authToken ? (
+              <button
+                type="button"
+                onClick={handleLockSession}
+                title="AI 辨識已解鎖，點擊鎖定"
+                className="px-2.5 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap"
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">已解鎖</span>
+                <LogOut className="w-3 h-3 opacity-80" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={async () => {
+                  setAuthError(null);
+                  await fetchAuthStatus();
+                  setAuthModalOpen(true);
+                }}
+                title="點擊輸入房東存取密碼解鎖 AI 辨識"
+                className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">解鎖 AI</span>
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -1569,16 +1903,31 @@ export default function App() {
             {/* Left Column: Meter AI Recognition & Inputs */}
             <div className="lg:col-span-7 space-y-4">
               {/* Room Header Summary */}
-              <div className="bg-white rounded-2xl p-4 border border-slate-200 flex items-center justify-between">
-                <div>
+              <div className="bg-white rounded-2xl p-4 border border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div className="space-y-1.5">
                   <h1 className="font-extrabold text-slate-900 text-lg tracking-tight">
                     {activeRoom} 號套房電錶核算
                   </h1>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    每月基本房租 NT$ {formatNumber(DEFAULT_ROOM_RENTS[activeRoom])} · 水費每人 $100
-                  </p>
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
+                    <label
+                      htmlFor={`rent-input-${activeRoom}`}
+                      className="font-medium text-slate-500"
+                    >
+                      每月基本房租 NT$
+                    </label>
+                    <input
+                      id={`rent-input-${activeRoom}`}
+                      type="text"
+                      inputMode="numeric"
+                      value={roomRents[activeRoom] ? String(roomRents[activeRoom]) : ""}
+                      placeholder="輸入月租金"
+                      onChange={(e) => handleRentChange(activeRoom, e.target.value)}
+                      className="w-28 bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1 text-xs font-mono font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                    <span className="text-slate-400">· 水費每人 $100（僅存本機）</span>
+                  </div>
                 </div>
-                <div className="text-right">
+                <div className="text-left sm:text-right shrink-0">
                   <span className="text-[11px] text-slate-400 block">
                     本期適用電價
                   </span>
@@ -2151,7 +2500,10 @@ export default function App() {
                             startShort && endShort
                               ? `${startShort}~${endShort}`
                               : "-";
-                          const rent = DEFAULT_ROOM_RENTS[activeRoom];
+                          const rent =
+                            item.rentPay !== undefined
+                              ? Number(item.rentPay)
+                              : roomRents[activeRoom] || 0;
                           const occ = item.occupants || 1;
                           const water =
                             item.waterPay !== undefined
@@ -2295,7 +2647,11 @@ export default function App() {
                     {ROOM_KEYS.map((room) => {
                       const rState = rooms[room];
                       const latest = rState.history[0];
-                      const rentBase = DEFAULT_ROOM_RENTS[room];
+                      const rentBase =
+                        roomRents[room] ||
+                        (latest?.rentPay !== undefined
+                          ? Number(latest.rentPay)
+                          : 0);
                       const occ = latest
                         ? latest.occupants || 1
                         : rState.occupants || 1;
@@ -2353,7 +2709,11 @@ export default function App() {
                       ROOM_KEYS.forEach((room) => {
                         const rState = rooms[room];
                         const latest = rState.history[0];
-                        const rentBase = DEFAULT_ROOM_RENTS[room];
+                        const rentBase =
+                          roomRents[room] ||
+                          (latest?.rentPay !== undefined
+                            ? Number(latest.rentPay)
+                            : 0);
                         const occ = latest
                           ? latest.occupants || 1
                           : rState.occupants || 1;
@@ -2614,6 +2974,115 @@ export default function App() {
                 取消
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Landlord Passcode Setup / Unlock Modal */}
+      {authModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-sm w-full p-5 space-y-4 shadow-2xl border border-slate-100">
+            <div className="flex justify-between items-center pb-2 border-b border-slate-100">
+              <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+                <KeyRound className="w-4 h-4 text-blue-600" />
+                <span>
+                  {!authStatus.configured
+                    ? "首次設定房東存取密碼"
+                    : "輸入房東存取密碼"}
+                </span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthModalOpen(false);
+                  setAuthError(null);
+                  setPasscodeInput("");
+                  setPasscodeConfirmInput("");
+                  pendingAiRequestRef.current = null;
+                }}
+                className="text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              {!authStatus.configured
+                ? "為避免公開部署後 AI 辨識額度被他人盜用，請先設定一組房東存取密碼（4 位以上）。正式發佈前也建議於伺服器環境變數設定 LANDLORD_PASSCODE。"
+                : "請輸入房東存取密碼以解鎖 AI 電錶拍照判讀功能（驗證狀態僅保留於本次瀏覽頁面記憶體中，關閉分頁即自動鎖定）。"}
+            </p>
+
+            <form onSubmit={handleAuthSubmit} className="space-y-3">
+              <div>
+                <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                  {!authStatus.configured ? "設定存取密碼" : "房東存取密碼"}
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  autoComplete={
+                    !authStatus.configured ? "new-password" : "current-password"
+                  }
+                  value={passcodeInput}
+                  onChange={(e) => setPasscodeInput(e.target.value)}
+                  placeholder="請輸入至少 4 位密碼"
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                />
+              </div>
+
+              {!authStatus.configured && (
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                    再次確認密碼
+                  </label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={passcodeConfirmInput}
+                    onChange={(e) => setPasscodeConfirmInput(e.target.value)}
+                    placeholder="請再次輸入相同密碼"
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+              )}
+
+              {authError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-3 py-2 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{authError}</span>
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="submit"
+                  disabled={authSubmitting}
+                  className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-bold py-2.5 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer"
+                >
+                  {authSubmitting ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <ShieldCheck className="w-4 h-4" />
+                  )}
+                  <span>
+                    {!authStatus.configured ? "建立密碼並解鎖" : "驗證並解鎖"}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthModalOpen(false);
+                    setAuthError(null);
+                    setPasscodeInput("");
+                    setPasscodeConfirmInput("");
+                    pendingAiRequestRef.current = null;
+                  }}
+                  className="px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold py-2.5 rounded-xl transition cursor-pointer"
+                >
+                  取消
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
