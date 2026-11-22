@@ -47,18 +47,18 @@ async function startServer() {
         ? imageBase64.split(",")[1]
         : imageBase64;
 
-      const systemInstruction = `你是一位專業的台灣出租套房電錶判讀專家（熟悉大同、中興、東元、玖鼎等單相瓦時計、機械滾輪式電錶、液晶數位式電錶與指針式電錶）。
-請仔細檢視使用者上傳的電錶照片，並準確判讀目前顯示的累積用電度數（kWh / 千瓦時）。
+      const promptText = `你是一位專業的台灣出租套房電錶判讀專家（熟悉大同、中興、東元、玖鼎等單相瓦時計、機械滾輪式電錶、液晶數位式電錶與指針式電錶）。
+請仔細檢視這張${room ? ` ${room} 號房` : ""}電錶照片，並準確判讀目前顯示的累積用電度數（kWh / 千瓦時）。
 
 判讀規則：
 1. 僅回傳電錶上的「整數」有效度數（reading）。
 2. 台灣常見的機械滾輪式電錶通常由左至右有 4 位或 5 位黑底白字的「整數位」，以及最右側 1 位紅框、紅字、或標有小數點（0.1 度）的「小數位」。請務必忽略最右側的小數位與前導零（例如：滾輪顯示 0 5 6 7 8 紅框 2，即 5678.2 度，reading 請回傳整數 5678）。
-3. 若為液晶數位式電錶，請讀取主畫面標示 kWh 的累積總度數，若有小數點（如 12345.6 kWh），請只取小數點前的整數 12345；請勿誤讀為電壓（如 110V/220V）、電流（A）或電錶出廠編號（No. / 6~8位印刷條碼號）。
-4. 若某個滾輪數字剛好卡在兩個數字中間（例如 7 與 8 之間），請觀察下一位數是否已跨過 0：若下一位為 8 或 9（尚未過 0），該位仍讀較小的數字；若已過 0 則讀較大的數字。
-5. 若相片中完全沒有電錶或模糊到無法辨識任何度數，請將 isReadable 設為 false，reading 設為 0。`;
+3. 若為液晶數位式電錶，請讀取主畫面標示 kWh 的累積總度數，若有小數點（如 12345.6 kWh），請只取小數點前的整數 12345；請勿誤讀為電壓（110V/220V）、電流（A）或電錶出廠編號。
+4. 若相片中完全沒有電錶或模糊到無法辨識任何度數，請將 isReadable 設為 false，reading 設為 0。
+5. meterType 請填寫「機械滾輪式電錶」、「液晶數位式電錶」或「指針式電錶」；notes 請用繁體中文簡短說明判讀依據。`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: "gemini-3.1-flash-lite",
         contents: {
           parts: [
             {
@@ -68,36 +68,20 @@ async function startServer() {
               },
             },
             {
-              text: `請辨識這張${room ? ` ${room} 號房` : ""}電錶相片的目前整數度數（kWh），並回傳 JSON 結果。`,
+              text: promptText,
             },
           ],
         },
         config: {
-          systemInstruction,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              isReadable: {
-                type: Type.BOOLEAN,
-                description: "是否成功從照片中辨識出電錶度數",
-              },
-              reading: {
-                type: Type.INTEGER,
-                description: "電錶上的整數有效度數（已排除小數點後或紅框小數位）",
-              },
-              rawDisplay: {
-                type: Type.STRING,
-                description: "電錶視窗上顯示的完整數字字串（含前導零與小數位，例如 '05678.2'）",
-              },
-              meterType: {
-                type: Type.STRING,
-                description: "電錶類型，例如：機械滾輪式電錶、液晶數位式電錶、指針式電錶",
-              },
-              notes: {
-                type: Type.STRING,
-                description: "簡短說明判讀依據（例如：讀取整數窗格 5678，已忽略最右側紅框小數位 2）",
-              },
+              isReadable: { type: Type.BOOLEAN },
+              reading: { type: Type.INTEGER },
+              rawDisplay: { type: Type.STRING },
+              meterType: { type: Type.STRING },
+              notes: { type: Type.STRING },
             },
             required: ["isReadable", "reading", "rawDisplay", "meterType", "notes"],
           },

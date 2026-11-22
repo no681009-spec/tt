@@ -52,6 +52,26 @@ interface HistoryRecord {
   prevPhoto: string | null;
 }
 
+interface SavedBillSnapshot {
+  rentStart: string;
+  rentEnd: string;
+  meterDate: string;
+  metrics: {
+    prev: number;
+    curr: number;
+    used: number;
+    rate: number;
+    elecPay: number;
+    occupants: number;
+    waterPay: number;
+    rent: number;
+    totalPay: number;
+    hasAnomaly: boolean;
+  };
+  photoBase64: string | null;
+  billText: string;
+}
+
 interface RoomState {
   history: HistoryRecord[];
   rentStart: string;
@@ -73,6 +93,7 @@ interface RoomState {
     error?: string;
   };
   cachedBillMessage: string | null;
+  lastSavedSnapshot: SavedBillSnapshot | null;
 }
 
 function formatLocalDate(d: Date): string {
@@ -752,6 +773,247 @@ export default function App() {
     await processSelectedFile(sampleFile, room, targetField);
   };
 
+  // 產生「當期房租水電費明細 + 電錶實拍照片」二合一高清長圖卡，解決手機 LINE 分享圖片時會忽略文字的問題
+  const buildCompositeBillAndPhotoFile = async (
+    room: RoomKey,
+    rStart: string,
+    rEnd: string,
+    meterDate: string,
+    metrics: ReturnType<typeof calculateRoomMetrics>,
+    photoBase64: string | null
+  ): Promise<{ file: File; base64: string }> => {
+    let loadedImg: HTMLImageElement | null = null;
+    if (photoBase64) {
+      loadedImg = await new Promise<HTMLImageElement | null>((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = `data:image/jpeg;base64,${photoBase64}`;
+      });
+    }
+
+    const width = 840;
+    const outerPad = 28;
+    const cardW = width - outerPad * 2;
+    const innerPad = 32;
+    const contentW = cardW - innerPad * 2;
+
+    let photoRenderH = 0;
+    if (loadedImg && loadedImg.width > 0 && loadedImg.height > 0) {
+      photoRenderH = Math.round((loadedImg.height / loadedImg.width) * contentW);
+      photoRenderH = Math.min(Math.max(photoRenderH, 280), 680);
+    }
+
+    const headerH = 92;
+    const infoSectionH = 190;
+    const feeBoxH = 236;
+    const photoSectionH = loadedImg ? photoRenderH + 68 : 0;
+    const footerH = 60;
+    const cardH =
+      headerH + infoSectionH + feeBoxH + photoSectionH + footerH + 24;
+    const height = cardH + outerPad * 2;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d")!;
+
+    // 畫布底色
+    ctx.fillStyle = "#f1f5f9";
+    ctx.fillRect(0, 0, width, height);
+
+    // 白色主卡片
+    const cardX = outerPad;
+    const cardY = outerPad;
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.roundRect(cardX, cardY, cardW, cardH, 24);
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#cbd5e1";
+    ctx.stroke();
+
+    // 頂部深色標題列
+    ctx.fillStyle = "#0f172a";
+    ctx.beginPath();
+    ctx.roundRect(cardX, cardY, cardW, headerH, [24, 24, 0, 0]);
+    ctx.fill();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 28px sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(
+      `⚡ ${room} 號房 本月房租水電費明細`,
+      cardX + innerPad,
+      cardY + headerH / 2
+    );
+
+    ctx.fillStyle = "#fbbf24";
+    ctx.font = "bold 17px monospace";
+    ctx.textAlign = "right";
+    ctx.fillText(
+      `抄表日期：${meterDate}`,
+      cardX + cardW - innerPad,
+      cardY + headerH / 2
+    );
+
+    // 租期與度數資訊區
+    let curY = cardY + headerH + 26;
+    const leftX = cardX + innerPad;
+    const midX = cardX + Math.floor(cardW * 0.54);
+
+    const drawInfoItem = (
+      label: string,
+      val: string,
+      x: number,
+      y: number,
+      highlight = false
+    ) => {
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillStyle = "#64748b";
+      ctx.font = "bold 17px sans-serif";
+      ctx.fillText(label, x, y);
+
+      ctx.fillStyle = highlight ? "#1d4ed8" : "#0f172a";
+      ctx.font = highlight ? "bold 20px monospace" : "bold 19px monospace";
+      ctx.fillText(val, x + 108, y - 1);
+    };
+
+    drawInfoItem("【租賃期間】", `${rStart} ~ ${rEnd}`, leftX, curY);
+    curY += 44;
+    drawInfoItem("【前期度數】", `${metrics.prev} 度 (舊)`, leftX, curY);
+    drawInfoItem("【本期度數】", `${metrics.curr} 度 (新)`, midX, curY, true);
+    curY += 44;
+    drawInfoItem(
+      "【實用度數】",
+      `${metrics.used} 度`,
+      leftX,
+      curY,
+      true
+    );
+    drawInfoItem(
+      "【計費費率】",
+      `${metrics.rate.toFixed(1)} 元/度 (${metrics.occupants}人)`,
+      midX,
+      curY
+    );
+
+    // 費用明細區塊
+    curY += 54;
+    const feeBoxX = cardX + innerPad;
+    const feeBoxW = contentW;
+    ctx.fillStyle = "#f8fafc";
+    ctx.beginPath();
+    ctx.roundRect(feeBoxX, curY, feeBoxW, feeBoxH, 16);
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.stroke();
+
+    let feeRowY = curY + 26;
+    const drawFeeRow = (label: string, amountStr: string, color = "#1e293b") => {
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillStyle = "#334155";
+      ctx.font = "bold 19px sans-serif";
+      ctx.fillText(label, feeBoxX + 24, feeRowY);
+
+      ctx.textAlign = "right";
+      ctx.fillStyle = color;
+      ctx.font = "bold 21px monospace";
+      ctx.fillText(amountStr, feeBoxX + feeBoxW - 24, feeRowY - 1);
+      feeRowY += 44;
+    };
+
+    drawFeeRow("🏠 房屋租金", `NT$ ${formatNumber(metrics.rent)}`);
+    drawFeeRow(
+      `💧 自來水費 (${metrics.occupants}人 × $100)`,
+      `NT$ ${formatNumber(metrics.waterPay)}`,
+      "#0e7490"
+    );
+    drawFeeRow(
+      `⚡ 本期電費 (${metrics.used}度 × ${metrics.rate.toFixed(1)}元)`,
+      `NT$ ${formatNumber(metrics.elecPay)}`,
+      "#1d4ed8"
+    );
+
+    // 分隔線
+    ctx.strokeStyle = "#cbd5e1";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(feeBoxX + 20, feeRowY + 2);
+    ctx.lineTo(feeBoxX + feeBoxW - 20, feeRowY + 2);
+    ctx.stroke();
+
+    feeRowY += 18;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#0f172a";
+    ctx.font = "bold 24px sans-serif";
+    ctx.fillText("💰 本期應繳總額", feeBoxX + 24, feeRowY);
+
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#047857";
+    ctx.font = "bold 28px monospace";
+    ctx.fillText(
+      `NT$ ${formatNumber(metrics.totalPay)}`,
+      feeBoxX + feeBoxW - 24,
+      feeRowY - 2
+    );
+
+    curY += feeBoxH + 24;
+
+    // 若有電錶實拍照片，直接嵌入明細下方
+    if (loadedImg && photoRenderH > 0) {
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillStyle = "#334155";
+      ctx.font = "bold 18px sans-serif";
+      ctx.fillText(
+        "📸 本期電錶實拍紀錄相片（請核對錶面度數）",
+        cardX + innerPad,
+        curY
+      );
+      curY += 32;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(cardX + innerPad, curY, contentW, photoRenderH, 16);
+      ctx.clip();
+      ctx.drawImage(loadedImg, cardX + innerPad, curY, contentW, photoRenderH);
+      ctx.restore();
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#cbd5e1";
+      ctx.beginPath();
+      ctx.roundRect(cardX + innerPad, curY, contentW, photoRenderH, 16);
+      ctx.stroke();
+
+      curY += photoRenderH + 18;
+    }
+
+    // 底部提醒文字
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#64748b";
+    ctx.font = "600 16px sans-serif";
+    ctx.fillText(
+      "請核對上述房租水電明細與電錶度數無誤後繳納，謝謝您！",
+      width / 2,
+      cardY + cardH - footerH / 2
+    );
+
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    const base64 = dataUrl.split(",")[1];
+    const file = base64ToFile(
+      base64,
+      `${room}房本月水電明細與電錶_${meterDate}.jpg`
+    );
+    return { file, base64 };
+  };
+
   const handleSaveRoomRecord = (room: RoomKey) => {
     const rState = rooms[room];
     const metrics = calculateRoomMetrics(room, rState);
@@ -761,12 +1023,24 @@ export default function App() {
       return;
     }
 
+    const activePhoto =
+      rState.watermarkedCurrPhoto || rState.history[0]?.currPhoto || null;
+
     const lockedBill = generateBillText(room, {
       rentStart: rState.rentStart,
       rentEnd: rState.rentEnd,
       meterDate: globalEndDate,
       metrics,
     });
+
+    const snapshot: SavedBillSnapshot = {
+      rentStart: rState.rentStart,
+      rentEnd: rState.rentEnd,
+      meterDate: globalEndDate,
+      metrics,
+      photoBase64: activePhoto,
+      billText: lockedBill,
+    };
 
     const newRecord: HistoryRecord = {
       id: Date.now(),
@@ -780,28 +1054,18 @@ export default function App() {
       usedDegrees: metrics.used,
       rate: metrics.rate,
       elecPay: metrics.elecPay,
-      currPhoto: rState.watermarkedCurrPhoto || null,
+      currPhoto: activePhoto,
       prevPhoto: rState.watermarkedPrevPhoto || null,
     };
 
     const nextHistory = [newRecord, ...rState.history];
-    const nextRentStart = rState.rentEnd
-      ? calcNextDayStr(rState.rentEnd)
-      : rState.rentStart;
-    const nextRentEnd = rState.rentEnd
-      ? calcOneMonthEndDate(nextRentStart)
-      : rState.rentEnd;
 
     setRooms((prev) => {
       const updatedRoom: RoomState = {
         ...prev[room],
         history: nextHistory,
-        rentStart: nextRentStart,
-        rentEnd: nextRentEnd,
-        prevDegreeInput: String(metrics.curr),
-        rawCurrPhoto: null,
-        watermarkedCurrPhoto: null,
         cachedBillMessage: lockedBill,
+        lastSavedSnapshot: snapshot,
       };
       const nextAll = { ...prev, [room]: updatedRoom };
       persistHistoryWithQuotaGuard(room, nextHistory, nextAll);
@@ -855,46 +1119,73 @@ export default function App() {
     document.body.removeChild(a);
   };
 
-  const handleSendToLine = async (room: RoomKey) => {
+  // 取得當期帳單完整資料（優先使用剛儲存鎖定的當期快照，或即時計算值）
+  const getActiveBillPayload = (room: RoomKey) => {
     const rState = rooms[room];
-    const msg = generateBillText(room);
-    await copyToClipboard(msg);
-
+    const liveMetrics = calculateRoomMetrics(room, rState);
+    if (
+      rState.lastSavedSnapshot &&
+      liveMetrics.curr === rState.lastSavedSnapshot.metrics.curr &&
+      liveMetrics.prev === rState.lastSavedSnapshot.metrics.prev
+    ) {
+      return rState.lastSavedSnapshot;
+    }
     const photoBase64 =
       rState.watermarkedCurrPhoto || rState.history[0]?.currPhoto || null;
+    const billText = generateBillText(room, {
+      rentStart: rState.rentStart,
+      rentEnd: rState.rentEnd,
+      meterDate: globalEndDate,
+      metrics: liveMetrics,
+    });
+    return {
+      rentStart: rState.rentStart,
+      rentEnd: rState.rentEnd,
+      meterDate: globalEndDate,
+      metrics: liveMetrics,
+      photoBase64,
+      billText,
+    };
+  };
 
-    if (photoBase64) {
-      try {
-        const photoFile = base64ToFile(
-          photoBase64,
-          `${room}房電錶照片_${globalEndDate || "最新"}.jpg`
-        );
-        if (navigator.canShare && navigator.canShare({ files: [photoFile] })) {
-          showToast("帳單已複製，請於系統分享選單傳送相片與明細", "success");
-          await navigator.share({
-            title: `${room} 房電費明細`,
-            text: msg,
-            files: [photoFile],
-          });
-          return;
-        }
-      } catch (err: unknown) {
-        if ((err as { name?: string })?.name === "AbortError") return;
-      }
+  // 傳送當期房租水電文字明細至 LINE（純文字格式，不使用截圖，確保 LINE 完整顯示文字明細）
+  const handleSendToLine = async (room: RoomKey) => {
+    const payload = getActiveBillPayload(room);
+    await copyToClipboard(payload.billText);
+    triggerExternalLink(
+      `https://line.me/R/share?text=${encodeURIComponent(payload.billText)}`
+    );
+    showToast("已複製並開啟 LINE 傳送當期房租水電文字明細！", "success");
+  };
 
-      downloadBase64Photo(photoBase64, `${room}房電錶照片_${globalEndDate}.jpg`);
-      showToast("已自動下載浮水印電錶相片並複製帳單，正前往 LINE 分享", "success");
-      setTimeout(() => {
-        triggerExternalLink(
-          `https://line.me/R/share?text=${encodeURIComponent(msg)}`
-        );
-      }, 450);
-    } else {
-      triggerExternalLink(
-        `https://line.me/R/share?text=${encodeURIComponent(msg)}`
-      );
-      showToast("已複製明細並開啟 LINE 傳送", "success");
+  // 單獨傳送電錶實拍照片（不含帳單截圖）
+  const handleSendMeterPhotoToLine = async (room: RoomKey) => {
+    const payload = getActiveBillPayload(room);
+    if (!payload.photoBase64) {
+      showToast("目前尚無電錶相片，請先拍照或上傳電錶相片", "warn");
+      return;
     }
+
+    try {
+      const photoFile = base64ToFile(
+        payload.photoBase64,
+        `${room}房電錶照片_${payload.meterDate || "最新"}.jpg`
+      );
+      if (navigator.canShare && navigator.canShare({ files: [photoFile] })) {
+        await navigator.share({
+          files: [photoFile],
+        });
+        return;
+      }
+    } catch (err: unknown) {
+      if ((err as { name?: string })?.name === "AbortError") return;
+    }
+
+    downloadBase64Photo(
+      payload.photoBase64,
+      `${room}房電錶照片_${payload.meterDate}.jpg`
+    );
+    showToast("已下載含日期浮水印的電錶照片！", "success");
   };
 
   // Native Canvas generator for Summary Chart (reliable, sharp, zero external dependencies)
@@ -963,19 +1254,18 @@ export default function App() {
       cardY + headerHeight / 2
     );
 
-    // Table Header
+    // Table Header (移除人數欄位，租賃期間僅顯示起始日)
     const thY = cardY + headerHeight;
     ctx.fillStyle = "#f1f5f9";
     ctx.fillRect(cardX + 1, thY, cardW - 2, tableHeadHeight);
 
     const cols = [
-      { label: "房號", x: cardX + 60, align: "center" as const },
+      { label: "房號", x: cardX + 70, align: "center" as const },
       { label: "租賃期間", x: cardX + 220, align: "center" as const },
-      { label: "人數", x: cardX + 370, align: "center" as const },
-      { label: "房屋租金", x: cardX + 500, align: "right" as const },
-      { label: "本期電費", x: cardX + 630, align: "right" as const },
-      { label: "自來水費", x: cardX + 740, align: "right" as const },
-      { label: "應繳總額", x: cardX + cardW - 28, align: "right" as const },
+      { label: "房屋租金", x: cardX + 410, align: "right" as const },
+      { label: "本期電費", x: cardX + 555, align: "right" as const },
+      { label: "自來水費", x: cardX + 690, align: "right" as const },
+      { label: "應繳總額", x: cardX + cardW - 32, align: "right" as const },
     ];
 
     ctx.fillStyle = "#475569";
@@ -1029,39 +1319,34 @@ export default function App() {
       ctx.textAlign = "center";
       ctx.fillText(room, cols[0].x, cy);
 
-      // Period
-      const periodStr = latest
-        ? `${latest.rentStart.substring(5).replace("-", "/")}~${latest.rentEnd.substring(5).replace("-", "/")}`
+      // Period (僅顯示起始日)
+      const periodStr = latest?.rentStart
+        ? latest.rentStart.substring(5).replace("-", "/")
         : "尚無紀錄";
       ctx.fillStyle = latest ? "#334155" : "#94a3b8";
-      ctx.font = "600 16px monospace";
+      ctx.font = "600 17px monospace";
       ctx.fillText(periodStr, cols[1].x, cy);
-
-      // Occupants
-      ctx.fillStyle = "#334155";
-      ctx.font = "600 17px sans-serif";
-      ctx.fillText(`${occ}人`, cols[2].x, cy);
 
       // Rent
       ctx.fillStyle = "#475569";
       ctx.font = "600 18px monospace";
       ctx.textAlign = "right";
-      ctx.fillText(`$${formatNumber(rentBase)}`, cols[3].x, cy);
+      ctx.fillText(`$${formatNumber(rentBase)}`, cols[2].x, cy);
 
       // Elec
       ctx.fillStyle = latest ? "#2563eb" : "#cbd5e1";
       ctx.font = "bold 18px monospace";
-      ctx.fillText(latest ? `$${formatNumber(elecPay)}` : "-", cols[4].x, cy);
+      ctx.fillText(latest ? `$${formatNumber(elecPay)}` : "-", cols[3].x, cy);
 
       // Water
       ctx.fillStyle = "#0891b2";
       ctx.font = "bold 18px monospace";
-      ctx.fillText(`$${formatNumber(waterFee)}`, cols[5].x, cy);
+      ctx.fillText(`$${formatNumber(waterFee)}`, cols[4].x, cy);
 
       // Total
       ctx.fillStyle = "#059669";
       ctx.font = "bold 20px monospace";
-      ctx.fillText(`$${formatNumber(totalPay)}`, cols[6].x, cy);
+      ctx.fillText(`$${formatNumber(totalPay)}`, cols[5].x, cy);
     });
 
     // Footer row
@@ -1075,22 +1360,22 @@ export default function App() {
     ctx.fillStyle = "#0f172a";
     ctx.font = "bold 20px sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText("合計總收", cols[1].x, fcy);
+    ctx.fillText("合計總收", Math.floor((cols[0].x + cols[1].x) / 2), fcy);
 
     ctx.textAlign = "right";
     ctx.font = "bold 19px monospace";
     ctx.fillStyle = "#334155";
-    ctx.fillText(`$${formatNumber(grandRent)}`, cols[3].x, fcy);
+    ctx.fillText(`$${formatNumber(grandRent)}`, cols[2].x, fcy);
 
     ctx.fillStyle = "#1d4ed8";
-    ctx.fillText(`$${formatNumber(grandElec)}`, cols[4].x, fcy);
+    ctx.fillText(`$${formatNumber(grandElec)}`, cols[3].x, fcy);
 
     ctx.fillStyle = "#0e7490";
-    ctx.fillText(`$${formatNumber(grandWater)}`, cols[5].x, fcy);
+    ctx.fillText(`$${formatNumber(grandWater)}`, cols[4].x, fcy);
 
     ctx.fillStyle = "#047857";
     ctx.font = "bold 24px monospace";
-    ctx.fillText(`$${formatNumber(grandTotal)}`, cols[6].x, fcy);
+    ctx.fillText(`$${formatNumber(grandTotal)}`, cols[5].x, fcy);
 
     return canvas;
   };
@@ -1122,22 +1407,17 @@ export default function App() {
         grandTotal += totalPay;
 
         const startShort = latest.rentStart
-          ? latest.rentStart.substring(5).replace("-", "/")
+          ? `(${latest.rentStart.substring(5).replace("-", "/")})`
           : "";
-        const endShort = latest.rentEnd
-          ? latest.rentEnd.substring(5).replace("-", "/")
-          : "";
-        const rentPeriod =
-          startShort && endShort ? `(${startShort}~${endShort})` : "";
 
-        msg += `【${room}房】$${formatNumber(totalPay)} (${occ}人) ${rentPeriod}\n`;
+        msg += `【${room}房】$${formatNumber(totalPay)} ${startShort}\n`;
         msg += ` ↳ 租金$${formatNumber(rentBase)} + 水費$${formatNumber(waterFee)} + 電費$${formatNumber(elecPay)}\n`;
       } else {
         const waterFee = currentOcc * 100;
         const totalPay = rentBase + waterFee;
         grandWater += waterFee;
         grandTotal += totalPay;
-        msg += `【${room}房】$${formatNumber(totalPay)} (${currentOcc}人，未抄表)\n`;
+        msg += `【${room}房】$${formatNumber(totalPay)} (未抄表)\n`;
       }
     });
 
@@ -1157,36 +1437,40 @@ export default function App() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    showToast("已下載高清總覽報表圖檔", "success");
+    showToast("已下載高清總覽報表截圖", "success");
   };
 
   const handleShareSummaryChart = async () => {
-    const canvas = buildSummaryChartCanvas();
-    const msg = generateSummaryText();
-    await copyToClipboard(msg);
+    showToast("正在產生總覽報表截圖...", "info");
+    try {
+      const canvas = buildSummaryChartCanvas();
+      const msg = generateSummaryText();
+      await copyToClipboard(msg);
 
-    canvas.toBlob(async (blob) => {
-      if (!blob) return;
-      const file = new File([blob], `套房水電總覽_${globalEndDate}.png`, {
-        type: "image/png",
-      });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        try {
-          await navigator.share({
-            title: "套房租金水電總覽",
-            text: msg,
-            files: [file],
-          });
-          return;
-        } catch {
-          // user cancelled or fallback
+      canvas.toBlob(async (blob) => {
+        if (!blob) return;
+        const file = new File([blob], `套房水電總覽_${globalEndDate}.png`, {
+          type: "image/png",
+        });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          try {
+            await navigator.share({
+              title: "套房租金水電總覽",
+              files: [file],
+            });
+            return;
+          } catch (err: unknown) {
+            if ((err as { name?: string })?.name === "AbortError") return;
+          }
         }
-      }
+        handleDownloadSummaryChart();
+        triggerExternalLink(
+          `https://line.me/R/share?text=${encodeURIComponent(msg)}`
+        );
+      }, "image/png");
+    } catch {
       handleDownloadSummaryChart();
-      triggerExternalLink(
-        `https://line.me/R/share?text=${encodeURIComponent(msg)}`
-      );
-    }, "image/png");
+    }
   };
 
   const activeRoom: RoomKey = activeTab === "summary" ? "102" : activeTab;
@@ -1748,25 +2032,35 @@ export default function App() {
                     <span>確認並儲存本期紀錄 (自動存浮水印相片)</span>
                   </button>
 
-                  <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleSendToLine(activeRoom)}
+                    className="w-full bg-[#06c755] hover:bg-[#05b34c] active:scale-[0.99] text-white py-3 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition cursor-pointer"
+                  >
+                    <Share2 className="w-4 h-4" />
+                    <span>傳送 LINE 房租水電文字明細</span>
+                  </button>
+
+                  <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
-                      onClick={() => handleSendToLine(activeRoom)}
-                      className="flex-1 bg-[#06c755] hover:bg-[#05b34c] active:scale-[0.99] text-white py-2.5 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                      onClick={() => handleSendMeterPhotoToLine(activeRoom)}
+                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 py-2.5 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
                     >
-                      <Share2 className="w-3.5 h-3.5" />
-                      <span>傳送 LINE 帳單與相片</span>
+                      <Camera className="w-3.5 h-3.5 text-amber-400" />
+                      <span>傳送/下載電錶照片</span>
                     </button>
                     <button
                       type="button"
                       onClick={async () => {
-                        await copyToClipboard(generateBillText(activeRoom));
-                        showToast("帳單明細已複製到剪貼簿！", "success");
+                        const payload = getActiveBillPayload(activeRoom);
+                        await copyToClipboard(payload.billText);
+                        showToast("帳單文字明細已複製到剪貼簿！", "success");
                       }}
-                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 py-2.5 px-3.5 rounded-xl font-bold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 py-2.5 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
                     >
                       <Copy className="w-3.5 h-3.5" />
-                      <span>複製明細</span>
+                      <span>複製文字明細</span>
                     </button>
                   </div>
                 </div>
@@ -1976,14 +2270,13 @@ export default function App() {
               </div>
 
               <div className="p-2 sm:p-4 overflow-x-auto">
-                <table className="w-full text-xs text-left border-collapse min-w-[480px]">
+                <table className="w-full text-xs text-left border-collapse min-w-[420px]">
                   <thead className="text-slate-500 bg-slate-50 border-b border-slate-200">
                     <tr>
                       <th className="py-3 px-2 font-bold text-center">房號</th>
                       <th className="py-3 px-2 font-bold text-center">
                         租賃期間
                       </th>
-                      <th className="py-3 px-2 font-bold text-center">人數</th>
                       <th className="py-3 px-2 font-bold text-right">
                         房屋租金
                       </th>
@@ -2017,13 +2310,7 @@ export default function App() {
                       const startShort = latest?.rentStart
                         ? latest.rentStart.substring(5).replace("-", "/")
                         : "";
-                      const endShort = latest?.rentEnd
-                        ? latest.rentEnd.substring(5).replace("-", "/")
-                        : "";
-                      const periodDisplay =
-                        startShort && endShort
-                          ? `${startShort}~${endShort}`
-                          : "尚無紀錄";
+                      const periodDisplay = startShort || "尚無紀錄";
 
                       return (
                         <tr
@@ -2040,9 +2327,6 @@ export default function App() {
                             }`}
                           >
                             {periodDisplay}
-                          </td>
-                          <td className="py-3 px-2 font-mono text-slate-700 text-center">
-                            {occ}人
                           </td>
                           <td className="py-3 px-2 text-right font-mono text-slate-600 tabular-nums">
                             ${formatNumber(rentBase)}
@@ -2089,7 +2373,7 @@ export default function App() {
                       return (
                         <tr>
                           <td
-                            colSpan={3}
+                            colSpan={2}
                             className="py-3.5 px-2 text-slate-800 text-center"
                           >
                             合計總收
@@ -2117,10 +2401,10 @@ export default function App() {
             <div className="bg-white rounded-2xl p-4 border border-slate-200 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
               <div>
                 <h3 className="font-bold text-slate-800 text-xs">
-                  匯出總覽報表圖檔與文字
+                  匯出總覽報表圖表
                 </h3>
                 <p className="text-[11px] text-slate-500 mt-0.5">
-                  一鍵產生高解析度表格圖片並複製總覽文字明細
+                  一鍵產生總覽報表截圖並傳送至 LINE
                 </p>
               </div>
               <div className="flex gap-2.5">
