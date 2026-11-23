@@ -304,6 +304,10 @@ async function startServer() {
     errorMessage: "短時間內 AI 辨識次數過多，請稍後再試",
   });
 
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true });
+  });
+
   // Check whether landlord passcode is configured and whether current session is unlocked
   app.get("/api/auth/status", (req, res) => {
     const envPasscode = getEnvPasscode();

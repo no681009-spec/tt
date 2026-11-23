@@ -32,10 +32,26 @@ type TabKey = RoomKey | "summary";
 
 const DB_KEY_PREFIX = "suite_meter_v2026_";
 const RENTS_STORAGE_KEY = `${DB_KEY_PREFIX}room_rents`;
-const CLOUD_RUN_API_BASE = (
-  import.meta.env.VITE_API_BASE_URL ||
-  "https://ais-pre-6fr6e6nrj5qe2bjyx6a5oi-654172174697.asia-east1.run.app"
-).replace(/\/+$/, "");
+const BACKEND_URL_STORAGE_KEY = `${DB_KEY_PREFIX}backend_url`;
+const BUILD_API_BASE = (import.meta.env.VITE_API_BASE_URL || "")
+  .trim()
+  .replace(/\/+$/, "");
+
+function normalizeBackendUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = new URL(trimmed);
+    const isHttps = parsed.protocol === "https:";
+    const isLocalHttp =
+      parsed.protocol === "http:" &&
+      (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+    if (!isHttps && !isLocalHttp) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
 
 const EMPTY_ROOM_RENTS: Record<RoomKey, number> = {
   "102": 0,
@@ -388,6 +404,26 @@ export default function App() {
     return base;
   });
 
+  // Optional custom backend server origin (for static hosts like GitHub Pages)
+  const [backendUrl, setBackendUrl] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem(BACKEND_URL_STORAGE_KEY);
+      if (saved) {
+        const normalized = normalizeBackendUrl(saved);
+        if (normalized) return normalized;
+      }
+    } catch {
+      // ignore
+    }
+    return BUILD_API_BASE;
+  });
+  const backendUrlRef = useRef<string>(backendUrl);
+  const [backendUrlInput, setBackendUrlInput] = useState<string>(backendUrl);
+  const [backendState, setBackendState] = useState<
+    "checking" | "connected" | "no_backend"
+  >("checking");
+  const [showBackendConfig, setShowBackendConfig] = useState(false);
+
   // Landlord passcode auth state — Bearer token kept strictly in JS/React memory (never in localStorage/sessionStorage)
   const [authToken, setAuthToken] = useState<string | null>(null);
   const authTokenRef = useRef<string | null>(null);
@@ -508,7 +544,8 @@ export default function App() {
     async (
       endpointPath: string,
       init: RequestInit = {},
-      overrideToken?: string | null
+      overrideToken?: string | null,
+      overrideBaseUrl?: string
     ): Promise<Response> => {
       const token =
         overrideToken !== undefined ? overrideToken : authTokenRef.current;
@@ -518,49 +555,104 @@ export default function App() {
       }
       const reqInit: RequestInit = { ...init, headers };
 
-      const isGitHubPages =
-        typeof window !== "undefined" &&
-        window.location.hostname.endsWith("github.io");
-
-      if (isGitHubPages) {
-        return fetch(`${CLOUD_RUN_API_BASE}${endpointPath}`, reqInit);
-      }
-
-      const res = await fetch(endpointPath, reqInit);
-      if (res.status === 404 || res.status === 405) {
-        return fetch(`${CLOUD_RUN_API_BASE}${endpointPath}`, reqInit);
-      }
-      return res;
+      const base =
+        overrideBaseUrl !== undefined ? overrideBaseUrl : backendUrlRef.current;
+      const targetUrl = base ? `${base}${endpointPath}` : endpointPath;
+      return fetch(targetUrl, reqInit);
     },
     []
   );
 
-  const fetchAuthStatus = useCallback(async () => {
-    try {
-      const res = await apiFetch("/api/auth/status", { method: "GET" });
-      if (!res.ok) return;
-      const data = (await res.json()) as {
-        configured?: boolean;
-        source?: "env" | "claimed" | "unclaimed";
-        authenticated?: boolean;
-      };
-      setAuthStatus({
-        checked: true,
-        configured: Boolean(data.configured),
-        source: data.source || "env",
-      });
-      if (data.authenticated === false && authTokenRef.current) {
-        authTokenRef.current = null;
-        setAuthToken(null);
+  const fetchAuthStatus = useCallback(
+    async (overrideBaseUrl?: string): Promise<boolean> => {
+      const activeBase =
+        overrideBaseUrl !== undefined ? overrideBaseUrl : backendUrlRef.current;
+      const isStaticHost =
+        typeof window !== "undefined" &&
+        window.location.hostname.endsWith("github.io");
+
+      // GitHub Pages has no /api/* server unless a custom backend origin is configured
+      if (isStaticHost && !activeBase) {
+        setBackendState("no_backend");
+        return false;
       }
-    } catch {
-      // Offline or unreachable backend; manual mode still works locally
-    }
-  }, [apiFetch]);
+
+      try {
+        const res = await apiFetch(
+          "/api/auth/status",
+          { method: "GET" },
+          undefined,
+          activeBase
+        );
+        const contentType = res.headers.get("content-type") || "";
+        if (!res.ok || !contentType.includes("application/json")) {
+          setBackendState("no_backend");
+          return false;
+        }
+        const data = (await res.json()) as {
+          configured?: boolean;
+          source?: "env" | "claimed" | "unclaimed";
+          authenticated?: boolean;
+        };
+        setBackendState("connected");
+        setAuthStatus({
+          checked: true,
+          configured: Boolean(data.configured),
+          source: data.source || "env",
+        });
+        if (data.authenticated === false && authTokenRef.current) {
+          authTokenRef.current = null;
+          setAuthToken(null);
+        }
+        return true;
+      } catch {
+        setBackendState("no_backend");
+        return false;
+      }
+    },
+    [apiFetch]
+  );
 
   useEffect(() => {
     fetchAuthStatus();
   }, [fetchAuthStatus]);
+
+  const handleSaveBackendUrl = async () => {
+    const normalized = normalizeBackendUrl(backendUrlInput);
+    if (normalized === null) {
+      setAuthError("請輸入有效的 https:// 後端伺服器網址（例如 https://your-app.run.app）");
+      return;
+    }
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      backendUrlRef.current = normalized;
+      setBackendUrl(normalized);
+      setBackendUrlInput(normalized);
+      try {
+        if (normalized) {
+          localStorage.setItem(BACKEND_URL_STORAGE_KEY, normalized);
+        } else {
+          localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+        }
+      } catch {
+        // ignore storage errors
+      }
+      const ok = await fetchAuthStatus(normalized);
+      if (ok) {
+        setShowBackendConfig(false);
+        showToast("已成功連線至後端驗證伺服器！", "success");
+      } else {
+        setAuthError(
+          normalized
+            ? "無法連線至此後端網址，請確認該伺服器已啟動，且已將目前網域加入後端的 ALLOWED_ORIGINS"
+            : "目前網頁環境未提供後端服務，請輸入已部署的後端網址"
+        );
+      }
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
 
   const handleRentChange = (room: RoomKey, rawVal: string) => {
     const cleaned = rawVal.replace(/[^\d]/g, "");
@@ -2986,15 +3078,18 @@ export default function App() {
               <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
                 <KeyRound className="w-4 h-4 text-blue-600" />
                 <span>
-                  {!authStatus.configured
-                    ? "首次設定房東存取密碼"
-                    : "輸入房東存取密碼"}
+                  {backendState === "no_backend" || showBackendConfig
+                    ? "連線後端驗證服務"
+                    : !authStatus.configured
+                      ? "首次設定房東存取密碼"
+                      : "輸入房東存取密碼"}
                 </span>
               </h3>
               <button
                 type="button"
                 onClick={() => {
                   setAuthModalOpen(false);
+                  setShowBackendConfig(false);
                   setAuthError(null);
                   setPasscodeInput("");
                   setPasscodeConfirmInput("");
@@ -3006,83 +3101,183 @@ export default function App() {
               </button>
             </div>
 
-            <p className="text-xs text-slate-600 leading-relaxed">
-              {!authStatus.configured
-                ? "為避免公開部署後 AI 辨識額度被他人盜用，請先設定一組房東存取密碼（4 位以上）。正式發佈前也建議於伺服器環境變數設定 LANDLORD_PASSCODE。"
-                : "請輸入房東存取密碼以解鎖 AI 電錶拍照判讀功能（驗證狀態僅保留於本次瀏覽頁面記憶體中，關閉分頁即自動鎖定）。"}
-            </p>
+            {backendState === "no_backend" || showBackendConfig ? (
+              <div className="space-y-3">
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3 text-xs text-amber-950 space-y-1.5 leading-relaxed">
+                  <p className="font-bold">
+                    GitHub Pages 為純靜態網頁空間，無法執行後端驗證與 AI 辨識服務。
+                  </p>
+                  <p className="text-amber-900/90">
+                    • <strong>最簡單作法</strong>：請直接部署到支援 Node.js 的空間（如 Cloud Run、Render、Zeabur），前後端會在同一網址自動運作。
+                  </p>
+                  <p className="text-amber-900/90">
+                    • <strong>若要從 GitHub Pages 連線</strong>：請先將本專案後端部署至 Cloud Run / Render / Zeabur，設定環境變數{" "}
+                    <code className="font-mono bg-amber-100 px-1 rounded">
+                      ALLOWED_ORIGINS={typeof window !== "undefined" ? window.location.origin : "https://帳號.github.io"}
+                    </code>{" "}
+                    後，將後端網址貼在下方：
+                  </p>
+                </div>
 
-            <form onSubmit={handleAuthSubmit} className="space-y-3">
-              <div>
-                <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                  {!authStatus.configured ? "設定存取密碼" : "房東存取密碼"}
-                </label>
-                <input
-                  type="password"
-                  autoFocus
-                  autoComplete={
-                    !authStatus.configured ? "new-password" : "current-password"
-                  }
-                  value={passcodeInput}
-                  onChange={(e) => setPasscodeInput(e.target.value)}
-                  placeholder="請輸入至少 4 位密碼"
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-                />
-              </div>
-
-              {!authStatus.configured && (
                 <div>
                   <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                    再次確認密碼
+                    後端伺服器網址（https://）
                   </label>
                   <input
-                    type="password"
-                    autoComplete="new-password"
-                    value={passcodeConfirmInput}
-                    onChange={(e) => setPasscodeConfirmInput(e.target.value)}
-                    placeholder="請再次輸入相同密碼"
-                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    type="url"
+                    value={backendUrlInput}
+                    onChange={(e) => setBackendUrlInput(e.target.value)}
+                    placeholder="https://your-service.run.app"
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                 </div>
-              )}
 
-              {authError && (
-                <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-3 py-2 flex items-start gap-2">
-                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <span>{authError}</span>
+                {authError && (
+                  <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-3 py-2 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>{authError}</span>
+                  </div>
+                )}
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={authSubmitting}
+                    onClick={handleSaveBackendUrl}
+                    className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-bold py-2.5 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    {authSubmitting ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <ShieldCheck className="w-4 h-4" />
+                    )}
+                    <span>測試並連線</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (backendState === "connected") {
+                        setShowBackendConfig(false);
+                        setAuthError(null);
+                      } else {
+                        setAuthModalOpen(false);
+                        setAuthError(null);
+                        pendingAiRequestRef.current = null;
+                      }
+                    }}
+                    className="px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold py-2.5 rounded-xl transition cursor-pointer"
+                  >
+                    {backendState === "connected" ? "返回登入" : "稍後手動輸入"}
+                  </button>
                 </div>
-              )}
 
-              <div className="flex gap-2 pt-1">
-                <button
-                  type="submit"
-                  disabled={authSubmitting}
-                  className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-bold py-2.5 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer"
-                >
-                  {authSubmitting ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <ShieldCheck className="w-4 h-4" />
-                  )}
-                  <span>
-                    {!authStatus.configured ? "建立密碼並解鎖" : "驗證並解鎖"}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthModalOpen(false);
-                    setAuthError(null);
-                    setPasscodeInput("");
-                    setPasscodeConfirmInput("");
-                    pendingAiRequestRef.current = null;
-                  }}
-                  className="px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold py-2.5 rounded-xl transition cursor-pointer"
-                >
-                  取消
-                </button>
+                <p className="text-[11px] text-slate-400 text-center">
+                  無須連線後端仍可照常手動輸入度數、拍浮水印照與傳送 LINE 明細
+                </p>
               </div>
-            </form>
+            ) : (
+              <>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  {!authStatus.configured
+                    ? "為避免公開部署後 AI 辨識額度被他人盜用，請先設定一組房東存取密碼（4 位以上）。正式發佈前也建議於伺服器環境變數設定 LANDLORD_PASSCODE。"
+                    : "請輸入房東存取密碼以解鎖 AI 電錶拍照判讀功能（驗證狀態僅保留於本次瀏覽頁面記憶體中，關閉分頁即自動鎖定）。"}
+                </p>
+
+                <form onSubmit={handleAuthSubmit} className="space-y-3">
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      {!authStatus.configured ? "設定存取密碼" : "房東存取密碼"}
+                    </label>
+                    <input
+                      type="password"
+                      autoFocus
+                      autoComplete={
+                        !authStatus.configured
+                          ? "new-password"
+                          : "current-password"
+                      }
+                      value={passcodeInput}
+                      onChange={(e) => setPasscodeInput(e.target.value)}
+                      placeholder="請輸入至少 4 位密碼"
+                      className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                  </div>
+
+                  {!authStatus.configured && (
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                        再次確認密碼
+                      </label>
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={passcodeConfirmInput}
+                        onChange={(e) => setPasscodeConfirmInput(e.target.value)}
+                        placeholder="請再次輸入相同密碼"
+                        className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                      />
+                    </div>
+                  )}
+
+                  {authError && (
+                    <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-3 py-2 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>{authError}</span>
+                    </div>
+                  )}
+
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      type="submit"
+                      disabled={authSubmitting}
+                      className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-bold py-2.5 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      {authSubmitting ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <ShieldCheck className="w-4 h-4" />
+                      )}
+                      <span>
+                        {!authStatus.configured
+                          ? "建立密碼並解鎖"
+                          : "驗證並解鎖"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthModalOpen(false);
+                        setAuthError(null);
+                        setPasscodeInput("");
+                        setPasscodeConfirmInput("");
+                        pendingAiRequestRef.current = null;
+                      }}
+                      className="px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold py-2.5 rounded-xl transition cursor-pointer"
+                    >
+                      取消
+                    </button>
+                  </div>
+
+                  {backendUrl && (
+                    <div className="pt-1 flex items-center justify-between text-[11px] text-slate-400">
+                      <span className="truncate max-w-[210px] font-mono">
+                        後端：{backendUrl}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthError(null);
+                          setShowBackendConfig(true);
+                        }}
+                        className="text-blue-600 hover:underline font-medium shrink-0 cursor-pointer"
+                      >
+                        更換網址
+                      </button>
+                    </div>
+                  )}
+                </form>
+              </>
+            )}
           </div>
         </div>
       )}
